@@ -161,3 +161,135 @@ A consumer opens a channel and registers against a specific queue — either by 
 ---
 
 _Corrections from session 2 review: Connection vs. Channel definitions clarified (a channel is a lightweight virtual connection multiplexed inside one TCP connection, not a separate network connection); routing pattern syntax fixed to include the required dot before wildcards (`user.#` / `user.*`, not `user#` / `user*`); the `*` wildcard example corrected, since it matches exactly one word and therefore does not match a bare `user` with zero following words; "round robin" explained; queue-growth note expanded to mention RabbitMQ's optional length/TTL policies; and the three blank sections (creating a queue, publishing a message, consuming a message) written out at a high level._
+
+# RabbitMQ Session 3 Notes
+*Date: July 1, 2026 — Final session*
+
+## Dead Letter
+
+In synchronous systems, communicating parties know immediately whether an operation succeeded. Async pub/sub has no such luxury — so RabbitMQ handles failure through **dead letter exchanges (DLX)** and **dead letter queues (DLQ)**.
+
+A dead letter queue is a log of failed messages, typically consumed manually for inspection or retry. The dead letter exchange is just a normal exchange whose only job is to route messages from normal queues into those DLQs. Neither is on by default — you wire them up the same way you would any ordinary exchange/queue, plus one extra step: you configure the DLX as an argument on the normal queue (`x-dead-letter-exchange`), so RabbitMQ knows where to send messages that go wrong on that queue.
+
+Messages end up dead-lettered for exactly three reasons (not just nack):
+1. A consumer **nacks with requeue=false** (explicit discard)
+2. The message **TTL expires** (you set a time-to-live and it ran out in the queue)
+3. The queue **exceeds its max-length** limit and drops the overflow
+
+The mechanism that tells the broker about success or failure is `ack` / `nack`:
+
+- **`ack` (acknowledge)** — processing succeeded; broker can drop the message.
+- **`nack` (negative acknowledge)** — processing failed. Two variants:
+  - `nack requeue: true` — put the message back on the queue for another attempt.
+  - `nack requeue: false` (discard) — don't retry; if a DLX is configured, send it there.
+
+> **Watch out:** `nack requeue: true` can produce an infinite loop if the failure is persistent (e.g., a malformed message that will always crash the consumer). Production systems usually pair requeue with a retry counter, or just go straight to `nack discard` + DLQ so a human can inspect it.
+
+### Delivery guarantees
+
+The ack/nack permutations above map directly to three delivery semantics:
+
+| Guarantee | What it means | How |
+|---|---|---|
+| **At-most-once** | Message is delivered once, or not at all. No retries, no duplicates. | Broker drops the message as soon as it sends it, before the consumer processes it (auto-ack). Fast, but unreliable. |
+| **At-least-once** | Message is delivered one or more times — never lost, but might be duplicated. | Consumer acks only after successful processing. If it crashes before acking, the broker redelivers. |
+| **Exactly-once** | Message is delivered exactly once — never lost, never duplicated. | Requires distributed transactions or idempotent consumers + deduplication logic. Notoriously hard to implement correctly. |
+
+**`at-least-once` with idempotent consumers is the sensible default** (as the course author also recommends). "Idempotent" just means your consumer handles receiving the same message twice gracefully — e.g., by checking "did I already process this order ID?" before acting.
+
+## Data Serialization
+
+Data serialization is the process of converting your data into a transmittable format so it can be sent over the network. The course has used JSON so far, but JSON is not the most efficient option at scale.
+
+Why JSON is "heavy":
+- It's text-based — every field name is repeated verbatim in every message.
+- A field called `"transactionId"` costs 15 bytes of overhead *per message* just for the key.
+- At thousands of messages per second, that adds up fast in bandwidth, memory, and parse time.
+
+**MessagePack** is a binary serialization format that encodes the same data structure as JSON but produces a much smaller payload. It's not human-readable, but it's widely supported across languages — if you need to decode it manually for debugging, there are online converters.
+
+Other serialization formats worth knowing:
+
+| Format | Type | Notes |
+|---|---|---|
+| **JSON** | Text | Human-readable, universal, but verbose |
+| **MessagePack** | Binary | JSON-compatible structure, much more compact |
+| **Protocol Buffers (Protobuf)** | Binary | Google's format; requires `.proto` schema files; very fast and strongly typed |
+| **Avro** | Binary | Common in Kafka ecosystems; schema is separate from the payload and managed via a schema registry |
+
+The tradeoff is always human-readability vs. efficiency. JSON wins for debugging and simplicity; binary formats win for throughput and scale.
+
+## Schema and Serialization
+
+**Schema** refers to the agreed-upon shape of the message payload — field names, types, and structure.
+
+The problem: if publisher and consumer are separate services (possibly maintained by different teams), they must agree on the schema. When you change the schema, you risk breaking consumers that are still expecting the old format — especially if there are messages in the queue *right now* that were published in the old shape and haven't been consumed yet.
+
+**Breaking changes** are changes that make old messages unreadable by new consumers, or new messages unreadable by old consumers. Changing a field's type (e.g. `age` from `string` to `number`) is the clearest example.
+
+Strategies for handling this safely:
+
+1. **Avoid breaking changes** — prefer additive changes (new optional fields) over mutations.
+2. **Version your routing keys/queues** — create a new `user.created.v2` routing key and queue pair for the new schema, keep `user.created.v1` alive until all consumers have migrated. The course author explicitly recommends this.
+3. **Support both formats temporarily** — have your consumer check which version of the schema arrived and handle both. Sunset the old path once the queue drains.
+4. **Use a schema registry** — tools like Confluent Schema Registry (common with Avro/Kafka) enforce schema compatibility at publish time before bad messages ever hit the queue.
+
+The underlying principle: in async systems you can never guarantee that publisher and consumer upgrade simultaneously. Design for the overlap period.
+
+## Nodes and Clusters
+
+From the course:
+
+> RabbitMQ and most other message brokers are distributed systems. Our local RabbitMQ server is just a single node, but in production, you'd likely have an entire cluster of nodes. Some advantages of a large cluster include:
+>
+> 1. **High Availability**: If one node goes down, other nodes can take over.
+> 2. **Scalability**: You're not constrained by the resources of a single machine.
+> 3. **Redundancy**: If one node goes down, the messages aren't lost.
+
+**Scale vertically first** (more RAM, faster disk on the same machine). Only reach for horizontal scaling (more nodes) when you've hit the ceiling or it's more cost-effective. Every node you add is more management overhead — distributed systems are inherently more complex to operate, debug, and reason about.
+
+For resource monitoring, the **Overview tab in the RabbitMQ Management Console** is your first port of call.
+
+## Backpressure
+
+From the course:
+
+> Backpressure is a common problem in Pub/Sub systems. It happens when messages are being published to a queue faster than they can be consumed. This leads to a growing queue size, which can eventually cause the system to run out of memory or disk space.
+
+> A healthy queue is an empty queue.
+
+When you see queues growing instead of draining, the fix is either: more consumer instances (scale out), faster consumer logic (optimise), or slowing down publishers (rate limiting). The last resort is setting a `max-length` policy on the queue so it caps out instead of growing indefinitely — but that means dropping or dead-lettering the overflow, so it's a safety net, not a strategy.
+
+## Prefetch
+
+By default, when a consumer connects, `amqplib` (and most AMQP client libraries) will pull *all* available messages off the queue into its internal in-memory buffer. If you have 1,000 messages and three consumers, consumer A can grab all 1,000 before B and C even get a chance — which defeats the point of having multiple consumers.
+
+**Prefetch count** (set via `channel.prefetch(n)` in `amqplib`, which calls `basic.qos` under the hood) limits how many *unacknowledged* messages a single consumer can hold at a time. Until it acks some, the broker won't send it more.
+
+Practical values:
+
+- `prefetch(1)` — maximum fairness; each consumer only ever holds one in-flight message. Broker waits for an ack before sending the next. Great for slow, uneven workloads but has per-message network overhead.
+- `prefetch(10–50)` — balanced; consumers batch-process a small chunk, reducing round trips while still spreading load across all consumers. Good default for most cases.
+- `prefetch(0)` (default if unset) — unlimited. Avoid this in multi-consumer setups.
+
+The short version: **always set a prefetch count**. The right number depends on how fast your consumer processes messages and how many consumers you have. Start at 10, observe queue drain rate, tune from there.
+
+## Classic vs. Quorum Queues
+
+These are the two queue types in modern RabbitMQ.
+
+| | Classic | Quorum |
+|---|---|---|
+| **Default?** | Yes | No |
+| **Scope** | Single node | Replicated across the cluster (Raft consensus) |
+| **Speed** | Faster | Slower (replication overhead) |
+| **Durability** | Lost if node goes down | Survives node failures |
+
+Lane's heuristic:
+- **Transient queues?** → Classic.
+- **Durable queues?** → Quorum.
+
+The reasoning: if a queue is transient by design (ephemeral web server queues with UUIDs, for example), replicating it across the cluster is wasted overhead. If it's durable and losing messages on a node failure is unacceptable, Quorum gives you the safety net.
+
+---
+*Corrections and expansions from session 3 review: DLX configured via `x-dead-letter-exchange` queue argument (not just "wired up"); three dead-letter triggers added (nack-discard, TTL expiry, max-length overflow); infinite-loop risk of nack-requeue flagged; delivery guarantee table rewritten (at-most-once corrected — it's the auto-ack fast-and-unreliable mode, not "at least consumed once"); idempotency note added; serialization format comparison table added; schema versioning strategies expanded; prefetch mechanics corrected (amqplib behaviour and `channel.prefetch()` API explained); Classic vs. Quorum table added.*
